@@ -1,0 +1,44 @@
+pipeline {
+    agent { label 'terraform-agent' }
+
+    parameters {
+        choice(
+            name: 'TERRAFORM_ACTION',
+            choices: ['apply', 'destroy'],
+            description: 'Choose whether Terraform should apply or destroy the infrastructure'
+        )
+    }
+
+    stages {
+        stage('Git Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Harshadphule/VPC-Network-Automated-Jenkins-Declarative-Pipeline.git'
+            }
+        }
+        stage('Terraform Init') {
+            steps {
+                dir('source-code') {
+                    sh 'terraform init'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir('source-code') {
+                    sh 'terraform plan -var-file=variable.tfvars'
+                }
+            }
+        }
+
+        stage('Terraform Action') {
+            steps {
+                dir('source-code') {
+                    sh(params.TERRAFORM_ACTION == 'apply'
+                        ? 'terraform apply -auto-approve -var-file=variable.tfvars'
+                        : 'terraform destroy -auto-approve -var-file=variable.tfvars')
+                }
+            }
+        }
+    }
+}
