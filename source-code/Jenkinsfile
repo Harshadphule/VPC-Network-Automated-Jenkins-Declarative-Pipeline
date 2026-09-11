@@ -1,5 +1,8 @@
 pipeline {
     agent { label 'terraform-agent' }
+    options {
+        skipDefaultCheckout(true)
+    }
 
     parameters {
         choice(
@@ -7,6 +10,17 @@ pipeline {
             choices: ['apply', 'destroy'],
             description: 'Choose whether Terraform should apply or destroy the infrastructure'
         )
+        booleanParam(
+            name: 'DELETE_S3_BACKEND',
+            defaultValue: false,
+            description: 'Delete the Terraform S3 backend bucket after destroy. Use only for learning/testing.'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        TF_STATE_BUCKET = 'terraform-vpc-state-bucket-declerative-1'
     }
 
     stages {
@@ -15,18 +29,30 @@ pipeline {
                 git branch: 'main', url: 'https://github.com/Harshadphule/VPC-Network-Automated-Jenkins-Declarative-Pipeline.git'
             }
         }
+        stage('Check Required Tools') {
+            steps {
+                sh '''
+                    set -e
+                    aws --version
+                    terraform version
+                    python3 --version
+                    aws sts get-caller-identity
+                '''
+            }
+        }
         stage('Ensure Terraform Backend') {
             steps {
                 sh '''
-                    if ! aws s3api head-bucket --bucket terraform-vpc-state-bucket-declerative-1 2>/dev/null; then
+                    set -e
+                    if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
                         aws s3api create-bucket \\
-                            --bucket terraform-vpc-state-bucket-declerative-1 \\
-                            --region ap-south-1 \\
-                            --create-bucket-configuration LocationConstraint=ap-south-1
+                            --bucket "$TF_STATE_BUCKET" \\
+                            --region "$AWS_REGION" \\
+                            --create-bucket-configuration LocationConstraint="$AWS_REGION"
                     fi
 
                     aws s3api put-bucket-versioning \\
-                        --bucket terraform-vpc-state-bucket-declerative-1 \\
+                        --bucket "$TF_STATE_BUCKET" \\
                         --versioning-configuration Status=Enabled
                 '''
             }
@@ -35,6 +61,14 @@ pipeline {
             steps {
                 dir('source-code') {
                     sh 'terraform init'
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                dir('source-code') {
+                    sh 'terraform validate'
                 }
             }
         }
@@ -50,11 +84,75 @@ pipeline {
         stage('Terraform Action') {
             steps {
                 dir('source-code') {
-                    sh(params.TERRAFORM_ACTION == 'apply'
-                        ? 'terraform apply -auto-approve -var-file=variable.tfvars'
-                        : 'terraform destroy -auto-approve -var-file=variable.tfvars')
+                    sh '''
+                        set -e
+                        if [ "$TERRAFORM_ACTION" = "apply" ]; then
+                            terraform apply -auto-approve -var-file=variable.tfvars
+                        elif [ "$TERRAFORM_ACTION" = "destroy" ]; then
+                            terraform destroy -auto-approve -var-file=variable.tfvars
+                        else
+                            echo "Invalid Terraform action: $TERRAFORM_ACTION"
+                            exit 1
+                        fi
+                    '''
                 }
             }
         }
+
+        stage('Delete S3 Backend') {
+            when {
+                allOf {
+                    expression { params.TERRAFORM_ACTION == 'destroy' }
+                    expression { params.DELETE_S3_BACKEND }
+                }
+            }
+            steps {
+                sh '''
+                    set -e
+                    aws s3 rm "s3://$TF_STATE_BUCKET" --recursive
+                    python3 - "$TF_STATE_BUCKET" <<'PY'
+import json
+import subprocess
+import sys
+
+bucket = sys.argv[1]
+result = subprocess.run(
+    ["aws", "s3api", "list-object-versions", "--bucket", bucket, "--output", "json"],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+data = json.loads(result.stdout)
+objects = [
+    {"Key": item["Key"], "VersionId": item["VersionId"]}
+    for item in data.get("Versions", []) + data.get("DeleteMarkers", [])
+]
+
+for start in range(0, len(objects), 1000):
+    subprocess.run(
+        [
+            "aws", "s3api", "delete-objects",
+            "--bucket", bucket,
+            "--delete", json.dumps({"Objects": objects[start:start + 1000]}),
+        ],
+        check=True,
+    )
+PY
+                    aws s3api delete-bucket --bucket "$TF_STATE_BUCKET" --region "$AWS_REGION"
+                '''
+            }
+        }
     }
-}
+
+    post {
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+        failure {
+            echo 'Pipeline failed. Check the console output for details.'
+        }
+        always {
+            echo "Terraform action selected: ${params.TERRAFORM_ACTION}"
+            echo "Delete S3 backend selected: ${params.DELETE_S3_BACKEND}"
+        }
+    }
