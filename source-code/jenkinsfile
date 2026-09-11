@@ -17,21 +17,27 @@ pipeline {
         }
         stage('Terraform Init') {
             steps {
-                sh 'terraform init'
+                dir('source-code') {
+                    sh 'terraform init'
+                }
             }
         }
 
         stage('Terraform Plan') {
             steps {
-                sh 'terraform plan'
+                dir('source-code') {
+                    sh 'terraform plan -var-file=variable.tfvars'
+                }
             }
         }
 
         stage('Terraform Action') {
             steps {
-                sh(params.TERRAFORM_ACTION == 'apply'
-                    ? 'terraform apply -auto-approve'
-                    : 'terraform destroy -auto-approve')
+                dir('source-code') {
+                    sh(params.TERRAFORM_ACTION == 'apply'
+                        ? 'terraform apply -auto-approve -var-file=variable.tfvars'
+                        : 'terraform destroy -auto-approve -var-file=variable.tfvars')
+                }
             }
         }
     }
