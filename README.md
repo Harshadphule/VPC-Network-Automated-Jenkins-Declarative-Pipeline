@@ -33,6 +33,20 @@ Automates AWS VPC network creation using **Terraform**, driven by a **Jenkins De
 
 ---
 
+## Setup order (why this matters)
+
+The master is touched **twice**, with the slave setup sandwiched in between — a few master-side steps can't happen until the slave exists:
+
+1. **Master, round 1** — install Jenkins itself, and prep the `jenkins` OS user (shell, password, SSH key). None of this depends on the slave.
+2. **Slave** — create its `jenkins` OS user, install Java/Git/Terraform, `aws configure`. This has to exist before the master can trust it.
+3. **Master, round 2** — `ssh-copy-id` into the slave to establish the SSH trust. This is the step that genuinely can't run earlier — it logs into the slave's `jenkins` account, which didn't exist until step 2.
+4. **Master — Jenkins UI** — create the admin user, add credentials, register the agent node. The "Launch via SSH" node setup needs the trust from step 3 to actually succeed.
+5. **Master — Jenkins UI** — create and run the pipeline job.
+
+The sections below follow this exact order.
+
+---
+
 ## Repository layout
 
 ```
@@ -57,7 +71,9 @@ Default values (`variable.tfvars`): region `ap-south-1`, VPC CIDR `10.0.0.0/16`,
 
 ---
 
-## Part 1 — Provision the Jenkins Master (EC2 Server 1)
+## Part 1 — Master, round 1: install Jenkins (EC2 Server 1)
+
+Nothing here depends on the slave — do this whenever.
 
 ```bash
 # Update packages
@@ -82,7 +98,7 @@ sudo systemctl start jenkins
 sudo systemctl status jenkins
 ```
 
-### Configure the `jenkins` OS user for SSH-based agent connections
+### Prep the `jenkins` OS user for SSH-based agent connections
 
 ```bash
 # Confirm the jenkins user exists
@@ -103,19 +119,18 @@ sudo vi /etc/ssh/sshd_config
 sudo systemctl restart sshd
 ```
 
-Generate an SSH key pair as the `jenkins` user (used to connect to the agent):
+Generate an SSH key pair as the `jenkins` user:
 
 ```bash
 su - jenkins
 ssh-keygen -t rsa -b 4096
-# copy the public key (~/.ssh/id_rsa.pub) — you'll add it to the agent's authorized_keys
 ```
 
-> Security note: enabling SSH password authentication is convenient for initial setup/learning environments. In production, disable it again once key-based auth works, and prefer Jenkins credentials (SSH private key) over a static jenkins-user password.
+**Stop here.** The next master step (`ssh-copy-id`) needs the slave's `jenkins` user to exist first — go set up Part 2 now, then come back to Part 3.
 
 ---
 
-## Part 2 — Provision the Jenkins Agent / Slave (EC2 Server 2)
+## Part 2 — Slave: prep the agent (EC2 Server 2)
 
 ```bash
 # Create the jenkins user
@@ -142,13 +157,34 @@ aws configure
 # AWS Access Key ID / Secret Access Key / region (ap-south-1) / output format
 ```
 
-Add the master's public key to `~jenkins/.ssh/authorized_keys` on this agent so the master can SSH in as `jenkins` without a password.
+Once this is done, the slave's `jenkins` user exists, has a password, and SSH password auth is enabled — it's ready to accept the master's `ssh-copy-id` connection in Part 3.
 
 ---
 
-## Part 3 — Configure Jenkins (done on the Master server)
+## Part 3 — Master, round 2: establish the SSH trust
 
-> Everything in this section happens through the Jenkins web UI on the **master** — you're not running anything on the agent/slave console here. The "Launch via SSH" step below is the master reaching out *to* the agent, not something done on the agent itself.
+Back on the **master**, as the `jenkins` user (same session as Part 1's `ssh-keygen`, or `su - jenkins` again):
+
+```bash
+ssh-copy-id jenkins@<agent-private-ip>
+```
+
+This is the step that actually can't happen until the slave is ready — it logs into the slave's `jenkins` account (using the password you set in Part 2) and appends the master's public key to `~jenkins/.ssh/authorized_keys` on the agent. After this, the master can SSH into the agent as `jenkins` without a password, which is what lets Jenkins launch the agent via SSH in Part 4.
+
+Quick check before moving on:
+
+```bash
+ssh jenkins@<agent-private-ip>
+# should log in with no password prompt
+```
+
+> Security note: enabling SSH password authentication (on both boxes) is convenient for initial setup/learning environments. In production, disable `PasswordAuthentication` again once key-based auth works, and prefer Jenkins credentials (SSH private key) over a static jenkins-user password.
+
+---
+
+## Part 4 — Master: configure Jenkins (Jenkins UI)
+
+> Everything here happens through the Jenkins web UI on the **master**. Doing this before Part 3 will make the "Launch agents via SSH" step fail, since there'd be no trust yet.
 
 1. **Open the Jenkins UI**: `http://<master-public-ip>:8080`
 2. **Unlock Jenkins** using the initial admin password:
@@ -169,7 +205,7 @@ Add the master's public key to `~jenkins/.ssh/authorized_keys` on this agent so 
 
 ---
 
-## Part 4 — Create and Run the Pipeline
+## Part 5 — Master: create and run the pipeline
 
 1. **New Item → Pipeline**, give it a name.
 2. Under **Pipeline**, set:
@@ -197,11 +233,11 @@ Add the master's public key to `~jenkins/.ssh/authorized_keys` on this agent so 
 ## Prerequisites checklist
 
 - [ ] Two EC2 instances (Amazon Linux), security groups allow: 8080 (Jenkins UI, master), 22 (SSH, both)
-- [ ] Master: Java 21, Jenkins installed and running
-- [ ] Agent: Java 21, Git, Terraform, AWS CLI configured with credentials that can create VPC/EC2/S3 resources
-- [ ] SSH trust set up from master → agent (jenkins user)
-- [ ] Jenkins agent node configured with label `terraform-agent`
-- [ ] Pipeline job pointing at this repo, script path `source-code/Jenkinsfile`
+- [ ] Master: Java 21, Jenkins installed and running (Part 1)
+- [ ] Agent: Java 21, Git, Terraform, AWS CLI configured with credentials that can create VPC/EC2/S3 resources (Part 2)
+- [ ] SSH trust set up master → agent via `ssh-copy-id jenkins@<agent-ip>`, run from the master **after** the agent's `jenkins` user exists (Part 3)
+- [ ] Jenkins agent node configured with label `terraform-agent` (Part 4)
+- [ ] Pipeline job pointing at this repo, script path `source-code/Jenkinsfile` (Part 5)
 
 ## Cleanup
 
