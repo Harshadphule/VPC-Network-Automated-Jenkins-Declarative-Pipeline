@@ -15,6 +15,22 @@ pipeline {
                 git branch: 'main', url: 'https://github.com/Harshadphule/VPC-Network-Automated-Jenkins-Declarative-Pipeline.git'
             }
         }
+        stage('Ensure Terraform Backend') {
+            steps {
+                sh '''
+                    if ! aws s3api head-bucket --bucket terraform-vpc-state-bucket-declerative-1 2>/dev/null; then
+                        aws s3api create-bucket \\
+                            --bucket terraform-vpc-state-bucket-declerative-1 \\
+                            --region ap-south-1 \\
+                            --create-bucket-configuration LocationConstraint=ap-south-1
+                    fi
+
+                    aws s3api put-bucket-versioning \\
+                        --bucket terraform-vpc-state-bucket-declerative-1 \\
+                        --versioning-configuration Status=Enabled
+                '''
+            }
+        }
         stage('Terraform Init') {
             steps {
                 dir('source-code') {
